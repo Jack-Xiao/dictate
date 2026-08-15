@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import Accelerate
 import CoreMedia
 import DictateCore
 import Foundation
@@ -45,6 +46,90 @@ private final class ConsumeFlag: @unchecked Sendable {
     var done = false
 }
 
+enum MicLevelMeter {
+    static func normalizedLevel(for buffer: AVAudioPCMBuffer) -> Float {
+        guard buffer.frameLength > 0, let channel = buffer.floatChannelData?[0] else {
+            return 0
+        }
+
+        var rms: Float = 0
+        vDSP_rmsqv(channel, 1, &rms, vDSP_Length(buffer.frameLength))
+        let decibels = 20 * log10(max(rms, 0.000_001))
+        return min(1, max(0, (decibels + 52) / 42))
+    }
+}
+
+@available(macOS 26.0, *)
+private final class PreparedSpeechSession: @unchecked Sendable {
+    let cacheKey: String
+    let transcriber: DictationTranscriber
+    let analyzer: SpeechAnalyzer
+    let format: AVAudioFormat
+
+    init(
+        cacheKey: String,
+        transcriber: DictationTranscriber,
+        analyzer: SpeechAnalyzer,
+        format: AVAudioFormat
+    ) {
+        self.cacheKey = cacheKey
+        self.transcriber = transcriber
+        self.analyzer = analyzer
+        self.format = format
+    }
+}
+
+/// Keeps one fully prepared analyzer per language. Checkout consumes the slot;
+/// the runner replenishes it after the utterance has reached a terminal state.
+@available(macOS 26.0, *)
+private actor SpeechSessionPool {
+    static let shared = SpeechSessionPool()
+
+    private var slots: [String: Task<PreparedSpeechSession, Error>] = [:]
+
+    func preheat(localeIdentifier: String) async throws {
+        let key = Self.key(for: localeIdentifier)
+        let task = slot(for: key)
+        do {
+            _ = try await task.value
+        } catch {
+            slots[key] = nil
+            throw error
+        }
+    }
+
+    func checkout(localeIdentifier: String) async throws -> PreparedSpeechSession {
+        let key = Self.key(for: localeIdentifier)
+        let task = slots.removeValue(forKey: key) ?? Self.makeTask(for: key)
+        return try await task.value
+    }
+
+    func replenish(localeIdentifier: String) {
+        let key = Self.key(for: localeIdentifier)
+        guard slots[key] == nil else { return }
+        slots[key] = Self.makeTask(for: key)
+    }
+
+    private func slot(for key: String) -> Task<PreparedSpeechSession, Error> {
+        if let task = slots[key] {
+            return task
+        }
+        let task = Self.makeTask(for: key)
+        slots[key] = task
+        return task
+    }
+
+    private static func makeTask(for key: String) -> Task<PreparedSpeechSession, Error> {
+        Task(priority: .userInitiated) {
+            try await SpeechRunner.makePreparedSession(localeIdentifier: key)
+        }
+    }
+
+    private static func key(for localeIdentifier: String) -> String {
+        Locale(identifier: localeIdentifier).identifier
+    }
+}
+
 /// One SpeechRunner belongs to exactly one utterance. Actor isolation prevents
 /// start/finish/cancel from mutating the audio and analyzer state concurrently.
 @available(macOS 26.0, *)
@@ -58,26 +143,26 @@ actor SpeechRunner {
     private var isTerminal = false
     private var finishRequested = false
     private var inputSequenceStarted = false
+    private var checkedOutLocaleIdentifier: String?
 
-    /// Warms model resources for the process. The returned analyzer is never
-    /// attached to an utterance, so a late warmup cannot replace a live runner.
     static func preheatModel(localeIdentifier: String?) async throws {
-        let locale = try await pickDictationLocale(preferred: localeIdentifier)
-        let transcriber = makeDictationTranscriber(locale: locale)
-        try await ensureAssets(for: transcriber, locale: locale)
-        let analyzer = SpeechAnalyzer(
-            modules: [transcriber],
-            options: SpeechAnalyzer.Options(priority: .high, modelRetention: .processLifetime)
-        )
-        guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
-            throw SpeechError.unavailable("没有可用的麦克风音频格式")
+        guard let localeIdentifier else { return }
+        try await SpeechSessionPool.shared.preheat(localeIdentifier: localeIdentifier)
+    }
+
+    static func preheatModels(localeIdentifiers: [String]) async {
+        await withTaskGroup(of: Void.self) { group in
+            for localeIdentifier in Set(localeIdentifiers) {
+                group.addTask {
+                    try? await preheatModel(localeIdentifier: localeIdentifier)
+                }
+            }
         }
-        try await analyzer.prepareToAnalyze(in: format)
-        await analyzer.cancelAndFinishNow()
     }
 
     func start(
         localeIdentifier: String?,
+        onAudioLevel: @escaping @Sendable (Float) -> Void,
         onHypothesis: @escaping @Sendable (ASRHypothesis) -> Void
     ) async throws {
         guard !hasStarted else {
@@ -87,23 +172,15 @@ actor SpeechRunner {
         try checkMayStartAudio()
 
         do {
-            let locale = try await Self.pickDictationLocale(preferred: localeIdentifier)
-            try checkMayStartAudio()
-
-            let transcriber = Self.makeDictationTranscriber(locale: locale)
-            try await Self.ensureAssets(for: transcriber, locale: locale)
-            try checkMayStartAudio()
-
-            let analyzer = SpeechAnalyzer(
-                modules: [transcriber],
-                options: SpeechAnalyzer.Options(priority: .high, modelRetention: .processLifetime)
+            let requestedLocale = localeIdentifier ?? "zh-CN"
+            let prepared = try await SpeechSessionPool.shared.checkout(
+                localeIdentifier: requestedLocale
             )
+            checkedOutLocaleIdentifier = prepared.cacheKey
+            let transcriber = prepared.transcriber
+            let analyzer = prepared.analyzer
+            let format = prepared.format
             self.analyzer = analyzer
-            guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
-                throw SpeechError.unavailable("没有可用的麦克风音频格式")
-            }
-            try checkMayStartAudio()
-            try await analyzer.prepareToAnalyze(in: format)
             try checkMayStartAudio()
 
             consumeTask = Task {
@@ -137,6 +214,10 @@ actor SpeechRunner {
 
             self.engine = engine
             input.installTap(onBus: 0, bufferSize: 1_024, format: inputFormat) { buffer, _ in
+                let audioLevel = MicLevelMeter.normalizedLevel(for: buffer)
+                DispatchQueue.main.async {
+                    onAudioLevel(audioLevel)
+                }
                 guard let output = MicBufferConverter.convert(
                     buffer: buffer,
                     converter: converter,
@@ -222,11 +303,20 @@ actor SpeechRunner {
     }
 
     private func clearState() {
+        let localeIdentifier = checkedOutLocaleIdentifier
+        checkedOutLocaleIdentifier = nil
         continuation = nil
         consumeTask = nil
         analyzer = nil
         engine = nil
         tapInstalled = false
+        if let localeIdentifier {
+            Task {
+                await SpeechSessionPool.shared.replenish(
+                    localeIdentifier: localeIdentifier
+                )
+            }
+        }
     }
 
     private func checkMayStartAudio() throws {
@@ -285,6 +375,30 @@ actor SpeechRunner {
             transcriptionOptions: [.punctuation],
             reportingOptions: [.volatileResults, .frequentFinalization],
             attributeOptions: [.audioTimeRange]
+        )
+    }
+
+    fileprivate static func makePreparedSession(
+        localeIdentifier: String
+    ) async throws -> PreparedSpeechSession {
+        let locale = try await pickDictationLocale(preferred: localeIdentifier)
+        let transcriber = makeDictationTranscriber(locale: locale)
+        try await ensureAssets(for: transcriber, locale: locale)
+        let analyzer = SpeechAnalyzer(
+            modules: [transcriber],
+            options: SpeechAnalyzer.Options(priority: .high, modelRetention: .processLifetime)
+        )
+        guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(
+            compatibleWith: [transcriber]
+        ) else {
+            throw SpeechError.unavailable("没有可用的麦克风音频格式")
+        }
+        try await analyzer.prepareToAnalyze(in: format)
+        return PreparedSpeechSession(
+            cacheKey: localeIdentifier,
+            transcriber: transcriber,
+            analyzer: analyzer,
+            format: format
         )
     }
 

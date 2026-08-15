@@ -51,6 +51,9 @@ import Testing
     let enabled = parseArgs(["--translate", "--insert"])
     #expect(enabled.translationEnabled == true)
     #expect(enabled.commitMode == .insert)
+
+    let preview = parseArgs(["--preview-hud"])
+    #expect(preview.previewHUD)
 }
 
 @MainActor

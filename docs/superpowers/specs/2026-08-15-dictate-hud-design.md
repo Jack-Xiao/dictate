@@ -1,7 +1,7 @@
-# Dictate：本机流式听写（浮层 + 松手插入）
+# Dictate：本机流式听写（刘海 HUD + 松手插入）
 
 日期：2026-08-15
-状态：本机 v1 已实现
+状态：本机 v0.5 已实现
 
 ## 目标
 
@@ -12,24 +12,27 @@
 ## 架构
 
 ```
-Right Option 按下
+Right Option / Fn 按下
     → 等待 0.16 秒（短按 / Option 快捷键不触发）
+    → 右 Option 路由 zh-CN；Fn 路由 en-US
     → 创建独立 UtteranceTransaction
     → 捕获前台 PID + AXFocusedUIElement
-    → 创建本轮专属 SpeechRunner 并开麦
-    → 浮层显示 displayText
+    → 从双语言预热池取出本轮 SpeechAnalyzer 并开麦
+    → 固定刘海 HUD 显示 displayText
+    → 麦克风 RMS 音量直接驱动 Edge Glow / 粒子，不等待 ASR
 
 PARTIAL → 只替换 volatile
 FINAL   → 追加 committed，清空 volatile
 
-Right Option 松开
+Right Option / Fn 松开
     → 先登记 finish，阻止尚在启动的任务继续开麦
     → 结束输入并 finalizeAndFinishThroughEndOfInput
     → 排空结果流，只取 FINAL（dangling partial 丢弃）
     → 翻译开启时等待已调度的 FINAL 翻译，硬上限 2 秒
     → 生成「原文 + 已完成译文」；超时 / 失败则回退原文
     → 插入模式：校验 PID + AX 焦点仍是原目标
-        → 完整保存剪贴板 item/type，尝试一次 ⌘V
+        → AXSelectedText 可写时直接提交
+        → 否则完整保存剪贴板 item/type，尝试一次 ⌘V
         → changeCount 未变化时恢复剪贴板
     → 复制模式：只把完整结果写入剪贴板，不模拟按键
 
@@ -42,13 +45,13 @@ Esc → cancel，不插入
 |---|---|
 | `DictateCore.TextJoiner` | 中英混排拼接（CJK 之间不加空格） |
 | `DictateCore.DictateSession` | 纯状态机：idle / listening / 插入文本 |
-| `DictateCore.TalkGesture` | 右 Option 的等待、快捷键抑制、停止与取消状态机 |
+| `DictateCore.TalkGesture` | 热键的等待、快捷键抑制、停止与取消状态机 |
 | `DictateSettings` | 保存中文 / English 识别 locale、翻译开关与完成方式 |
 | `TranslationBatch` | 等待 FINAL 翻译；独立超时信号，不等待不响应取消的后台任务 |
 | `SpeechRunner` | SpeechAnalyzer 麦克风流，输出 hypothesis |
-| `OverlayPanel` | 非激活浮层，只显示，不抢焦点 |
-| `HotkeyMonitor` | 右 Option 按住说话；Esc 取消 |
-| `PasteInserter` | 插入模式验证原焦点并有条件还原剪贴板；复制模式只写剪贴板 |
+| `OverlayPanel` | 固定刘海 Compact Captions + 音量驱动 Edge Glow；点击穿透、不抢焦点 |
+| `HotkeyMonitor` | 右 Option 中文、Fn English；Esc 取消 |
+| `PasteInserter` | 验证原焦点后优先 AX 直写，失败才粘贴；复制模式只写剪贴板 |
 
 ## 约束
 
@@ -57,7 +60,7 @@ Esc → cancel，不插入
 - 默认翻译并插入原文 + 译文；菜单可关闭，或用 `--no-translate` 临时覆盖
 - 中文 / English 识别语言可从菜单切换并持久化
 - 插入 / 只复制可从菜单切换并持久化，或用 `--insert` / `--copy` 临时覆盖
-- 默认热键：右 Option（避开中文输入法 Control+Space / Spotlight）
+- 默认热键：右 Option 中文、Fn English（避开中文输入法 Control+Space / Spotlight）
 - 无辅助功能权限时：文本留在剪贴板，浮层提示手动粘贴
 - 音频不出本机
 
@@ -66,7 +69,7 @@ Esc → cancel，不插入
 - 在第三方输入框内闪字
 - 自动发送 / 回车
 - 云端 ASR、Nemotron、SenseVoice 校正
-- 多语言热切换 UI
+- 自动语言猜测或同一段中途切换识别模型
 
 ## 诚实边界
 

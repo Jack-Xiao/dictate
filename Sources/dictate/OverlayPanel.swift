@@ -1,112 +1,88 @@
 import AppKit
 import DictateCore
 
-/// Borderless HUD that can be dragged without activating the app.
+/// Fixed, click-through notch HUD. The host window never changes size while
+/// recognition is active, so partial updates cannot make the UI jump.
 @MainActor
 final class OverlayPanel {
     private let panel: NSPanel
-    private let statusLabel = NSTextField(labelWithString: "")
-    private let bodyView = OverlayTextView()
-    private let scrollView = NSScrollView()
-    private var rememberedOrigin: NSPoint?
-    private var hasBeenPlaced = false
+    private let hudView: NotchHUDView
     private var hideWorkItem: DispatchWorkItem?
 
-    private static let width: CGFloat = 620
-    private static let minHeight: CGFloat = 120
-    private static let maxHeight: CGFloat = 360
-    private static let horizontalPad: CGFloat = 18
-    private static let topPad: CGFloat = 14
-    private static let bottomPad: CGFloat = 14
+    private static let size = NSSize(width: 560, height: 118)
 
     init() {
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: Self.width, height: Self.minHeight),
+            contentRect: NSRect(origin: .zero, size: Self.size),
             styleMask: [.nonactivatingPanel, .fullSizeContentView, .borderless],
             backing: .buffered,
             defer: false
         )
+        hudView = NotchHUDView(frame: NSRect(origin: .zero, size: Self.size))
+
         panel.isFloatingPanel = true
-        panel.level = .statusBar
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.hidesOnDeactivate = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
-        panel.ignoresMouseEvents = false
-        panel.becomesKeyOnlyIfNeeded = true
-        panel.isMovableByWindowBackground = true
-
-        let blur = DragBlurView(frame: panel.contentView?.bounds ?? .zero)
-        blur.autoresizingMask = [.width, .height]
-        blur.material = .hudWindow
-        blur.blendingMode = .behindWindow
-        blur.state = .active
-        blur.wantsLayer = true
-        blur.layer?.cornerRadius = 16
-        blur.layer?.masksToBounds = true
-
-        statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        bodyView.drawsBackground = false
-        bodyView.isEditable = false
-        bodyView.isSelectable = false
-        bodyView.isRichText = true
-        bodyView.textContainerInset = NSSize(width: 0, height: 0)
-        bodyView.textContainer?.lineFragmentPadding = 0
-        bodyView.textContainer?.widthTracksTextView = true
-        bodyView.isVerticallyResizable = true
-        bodyView.isHorizontallyResizable = false
-        bodyView.autoresizingMask = [.width]
-        bodyView.minSize = NSSize(width: 0, height: 0)
-        bodyView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        bodyView.font = .systemFont(ofSize: 17, weight: .regular)
-
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.drawsBackground = false
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
-        scrollView.autohidesScrollers = true
-        scrollView.borderType = .noBorder
-        scrollView.documentView = bodyView
-        blur.addSubview(statusLabel)
-        blur.addSubview(scrollView)
-        NSLayoutConstraint.activate([
-            statusLabel.topAnchor.constraint(equalTo: blur.topAnchor, constant: Self.topPad),
-            statusLabel.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalPad),
-            statusLabel.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalPad),
-            scrollView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 6),
-            scrollView.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalPad),
-            scrollView.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalPad),
-            scrollView.bottomAnchor.constraint(equalTo: blur.bottomAnchor, constant: -Self.bottomPad),
-        ])
-        panel.contentView = blur
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.contentView = hudView
         panel.orderOut(nil)
     }
 
-    func show(session: DictateSession, status: String) {
+    func show(session: DictateSession, status: String, localeIdentifier: String) {
         present(
             status: status,
             spoken: session.displayCommitted,
             draft: session.partial,
-            translation: session.displayTranslation
+            translation: session.displayTranslation,
+            localeIdentifier: localeIdentifier,
+            isListening: true
         )
     }
 
     func showMessage(_ message: String) {
-        present(status: "Dictate", spoken: message, draft: "", translation: "")
+        present(
+            status: "Dictate",
+            spoken: message,
+            draft: "",
+            translation: "",
+            localeIdentifier: "",
+            isListening: false
+        )
+    }
+
+    func showPreview() {
+        hideWorkItem?.cancel()
+        hideWorkItem = nil
+        let screen = preferredScreen()
+        hudView.hasPhysicalNotch = screen.safeAreaInsets.top > 0
+        hudView.present(
+            status: "正在听…  灰色为草稿，定稿后翻译",
+            spoken: "Dictate 会把已经定稿的文字稳定保留下来，",
+            draft: "while the latest words stay live on screen",
+            translation: "Final translation appears here without blocking live transcription.",
+            localeIdentifier: "zh-CN",
+            isListening: true,
+            isPreview: true
+        )
+        applyFrame(on: screen)
+        panel.orderFrontRegardless()
+        hudView.startAnimating()
+    }
+
+    func updateAudioLevel(_ level: Float) {
+        hudView.updateAudioLevel(CGFloat(level))
     }
 
     func hide() {
         hideWorkItem?.cancel()
         hideWorkItem = nil
-        if panel.isVisible {
-            rememberedOrigin = panel.frame.origin
-        }
+        hudView.stopAnimating()
         panel.orderOut(nil)
-        hasBeenPlaced = false
     }
 
     func hide(after delay: TimeInterval) {
@@ -116,116 +92,313 @@ final class OverlayPanel {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
-    private func present(status: String, spoken: String, draft: String, translation: String) {
+    private func present(
+        status: String,
+        spoken: String,
+        draft: String,
+        translation: String,
+        localeIdentifier: String,
+        isListening: Bool
+    ) {
         hideWorkItem?.cancel()
         hideWorkItem = nil
-        statusLabel.stringValue = status
-        let locked = spoken.isEmpty && draft.isEmpty ? "…" : spoken
-        bodyView.setContent(spoken: locked, draft: draft, translation: translation)
 
-        let textWidth = Self.width - Self.horizontalPad * 2
-        bodyView.textContainer?.containerSize = NSSize(width: textWidth, height: .greatestFiniteMagnitude)
-        bodyView.setFrameSize(NSSize(width: textWidth, height: 10_000))
-        bodyView.layoutManager?.ensureLayout(for: bodyView.textContainer!)
-        let used = bodyView.layoutManager?.usedRect(for: bodyView.textContainer!).height ?? 40
-        let contentHeight = max(used + 4, 40)
-        bodyView.setFrameSize(NSSize(width: textWidth, height: contentHeight))
-        let chrome = Self.topPad + 18 + 6 + Self.bottomPad
-        let desired = chrome + contentHeight + 8
-        let height = min(Self.maxHeight, max(Self.minHeight, desired))
-
-        applyFrame(height: height)
-        scrollToEnd()
+        let screen = preferredScreen()
+        hudView.hasPhysicalNotch = screen.safeAreaInsets.top > 0
+        hudView.present(
+            status: status,
+            spoken: spoken,
+            draft: draft,
+            translation: translation,
+            localeIdentifier: localeIdentifier,
+            isListening: isListening,
+            isPreview: false
+        )
+        applyFrame(on: screen)
         if !panel.isVisible {
             panel.orderFrontRegardless()
         }
+        hudView.startAnimating()
     }
 
-    private func applyFrame(height: CGFloat) {
-        let screen = NSScreen.main ?? NSScreen.screens[0]
-        let visible = screen.visibleFrame
-        if !hasBeenPlaced {
-            let origin: NSPoint
-            if let rememberedOrigin {
-                origin = clamp(origin: rememberedOrigin, size: NSSize(width: Self.width, height: height), in: visible)
-            } else {
-                origin = NSPoint(
-                    x: visible.midX - Self.width / 2,
-                    y: visible.maxY - height - 28
-                )
+    private func applyFrame(on screen: NSScreen) {
+        let top: CGFloat
+        if screen.safeAreaInsets.top > 0 {
+            top = screen.frame.maxY
+        } else {
+            top = screen.visibleFrame.maxY - 10
+        }
+        let origin = NSPoint(
+            x: screen.frame.midX - Self.size.width / 2,
+            y: top - Self.size.height
+        )
+        panel.setFrame(NSRect(origin: origin, size: Self.size), display: true)
+    }
+
+    private func preferredScreen() -> NSScreen {
+        let pointer = NSEvent.mouseLocation
+        return NSScreen.screens.first { NSMouseInRect(pointer, $0.frame, false) }
+            ?? NSScreen.main
+            ?? NSScreen.screens[0]
+    }
+}
+
+@MainActor
+private final class NotchHUDView: NSView {
+    private let statusLabel = NSTextField(labelWithString: "")
+    private let languageLabel = NSTextField(labelWithString: "")
+    private let bodyLabel = NSTextField(wrappingLabelWithString: "")
+    private let translationLabel = NSTextField(labelWithString: "")
+    private var animationTimer: Timer?
+    private var animationPhase: CGFloat = 0
+    private var targetLevel: CGFloat = 0
+    private var displayedLevel: CGFloat = 0
+    private var lastLevelUpdate = ContinuousClock.now
+    private var isListening = false
+    private var isPreview = false
+    private let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+
+    var hasPhysicalNotch = false {
+        didSet { needsDisplay = true }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = false
+        setupLabels()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override var isFlipped: Bool { true }
+
+    func present(
+        status: String,
+        spoken: String,
+        draft: String,
+        translation: String,
+        localeIdentifier: String,
+        isListening: Bool,
+        isPreview: Bool = false
+    ) {
+        self.isListening = isListening
+        self.isPreview = isPreview
+        statusLabel.stringValue = isListening ? "●  \(status)" : status
+        statusLabel.textColor = isListening
+            ? NSColor(calibratedRed: 0.95, green: 0.42, blue: 0.63, alpha: 1)
+            : .secondaryLabelColor
+        languageLabel.stringValue = languageTitle(for: localeIdentifier)
+        languageLabel.isHidden = localeIdentifier.isEmpty
+        bodyLabel.attributedStringValue = bodyText(spoken: spoken, draft: draft)
+        translationLabel.stringValue = translation
+        translationLabel.isHidden = translation.isEmpty
+        needsDisplay = true
+    }
+
+    func updateAudioLevel(_ level: CGFloat) {
+        targetLevel = min(1, max(0, level))
+        lastLevelUpdate = .now
+    }
+
+    func startAnimating() {
+        guard animationTimer == nil else { return }
+        let interval = reduceMotion ? 1.0 / 12.0 : 1.0 / 30.0
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.tick()
             }
-            panel.setFrame(NSRect(origin: origin, size: NSSize(width: Self.width, height: height)), display: true)
-            hasBeenPlaced = true
-            return
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        animationTimer = timer
+    }
+
+    func stopAnimating() {
+        animationTimer?.invalidate()
+        animationTimer = nil
+        targetLevel = 0
+        displayedLevel = 0
+        animationPhase = 0
+        isPreview = false
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+
+        let shellRect = bounds.insetBy(dx: 7, dy: 5)
+        let shellPath = CGPath(
+            roundedRect: shellRect,
+            cornerWidth: 24,
+            cornerHeight: 24,
+            transform: nil
+        )
+
+        context.saveGState()
+        context.setShadow(
+            offset: .zero,
+            blur: 16 + displayedLevel * 18,
+            color: NSColor(calibratedRed: 0.27, green: 0.72, blue: 1, alpha: 0.28 + displayedLevel * 0.34).cgColor
+        )
+        context.addPath(shellPath)
+        context.setFillColor(NSColor(calibratedWhite: 0.025, alpha: 0.98).cgColor)
+        context.fillPath()
+        context.restoreGState()
+
+        if hasPhysicalNotch {
+            let bridge = CGRect(x: bounds.midX - 96, y: 0, width: 192, height: 25)
+            context.setFillColor(NSColor(calibratedWhite: 0.025, alpha: 1).cgColor)
+            context.fill(bridge)
         }
 
-        var frame = panel.frame
-        let top = frame.maxY
-        frame.size.height = height
-        frame.size.width = Self.width
-        frame.origin.y = top - height
-        frame.origin = clamp(origin: frame.origin, size: frame.size, in: visible)
-        panel.setFrame(frame, display: true)
+        drawGlow(path: shellPath, in: context)
+        drawParticles(in: shellRect, context: context)
     }
 
-    private func clamp(origin: NSPoint, size: NSSize, in visible: NSRect) -> NSPoint {
-        var x = origin.x
-        var y = origin.y
-        if x < visible.minX { x = visible.minX + 8 }
-        if x + size.width > visible.maxX { x = visible.maxX - size.width - 8 }
-        if y < visible.minY { y = visible.minY + 8 }
-        if y + size.height > visible.maxY { y = visible.maxY - size.height - 8 }
-        return NSPoint(x: x, y: y)
+    private func setupLabels() {
+        statusLabel.font = .systemFont(ofSize: 11.5, weight: .semibold)
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        languageLabel.font = .monospacedSystemFont(ofSize: 10.5, weight: .semibold)
+        languageLabel.textColor = NSColor(calibratedRed: 0.48, green: 0.83, blue: 1, alpha: 1)
+        languageLabel.alignment = .right
+        languageLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        bodyLabel.font = .systemFont(ofSize: 16.5, weight: .medium)
+        bodyLabel.textColor = .white
+        bodyLabel.maximumNumberOfLines = 2
+        bodyLabel.lineBreakMode = .byTruncatingHead
+        bodyLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        translationLabel.font = .systemFont(ofSize: 11.5, weight: .regular)
+        translationLabel.textColor = NSColor(calibratedWhite: 0.67, alpha: 1)
+        translationLabel.lineBreakMode = .byTruncatingTail
+        translationLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(statusLabel)
+        addSubview(languageLabel)
+        addSubview(bodyLabel)
+        addSubview(translationLabel)
+
+        NSLayoutConstraint.activate([
+            statusLabel.topAnchor.constraint(equalTo: topAnchor, constant: 18),
+            statusLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 28),
+            languageLabel.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
+            languageLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -28),
+            languageLabel.leadingAnchor.constraint(greaterThanOrEqualTo: statusLabel.trailingAnchor, constant: 12),
+
+            bodyLabel.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
+            bodyLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 28),
+            bodyLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -28),
+
+            translationLabel.topAnchor.constraint(equalTo: bodyLabel.bottomAnchor, constant: 4),
+            translationLabel.leadingAnchor.constraint(equalTo: bodyLabel.leadingAnchor),
+            translationLabel.trailingAnchor.constraint(equalTo: bodyLabel.trailingAnchor),
+            translationLabel.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -15),
+        ])
     }
 
-    private func scrollToEnd() {
-        bodyView.layoutSubtreeIfNeeded()
-        let maxY = max(bodyView.bounds.height, scrollView.contentView.bounds.height)
-        bodyView.scroll(NSPoint(x: 0, y: maxY))
+    private func tick() {
+        if isPreview {
+            targetLevel = 0.52 + sin(animationPhase * 1.7) * 0.24
+        } else if lastLevelUpdate.duration(to: .now) > .milliseconds(140) {
+            targetLevel = 0
+        }
+        let response: CGFloat = targetLevel > displayedLevel ? 0.48 : 0.14
+        displayedLevel += (targetLevel - displayedLevel) * response
+        if reduceMotion {
+            displayedLevel = min(displayedLevel, 0.45)
+        } else {
+            animationPhase += 0.035 + displayedLevel * 0.075
+        }
+        needsDisplay = true
     }
-}
 
-private final class DragBlurView: NSVisualEffectView {
-    override var mouseDownCanMoveWindow: Bool { true }
-
-    override func mouseDown(with event: NSEvent) {
-        window?.performDrag(with: event)
-    }
-}
-
-private final class OverlayTextView: NSTextView {
-    override var acceptsFirstResponder: Bool { false }
-    override var mouseDownCanMoveWindow: Bool { true }
-
-    func setContent(spoken: String, draft: String, translation: String) {
-        let body = NSMutableAttributedString()
-        let spokenFont = NSFont.systemFont(ofSize: 17, weight: .regular)
-        let draftFont = NSFont.systemFont(ofSize: 17, weight: .regular)
-        let transFont = NSFont.systemFont(ofSize: 14, weight: .regular)
-        if !spoken.isEmpty {
-            body.append(NSAttributedString(string: spoken, attributes: [
-                .font: spokenFont,
-                .foregroundColor: NSColor.labelColor,
+    private func bodyText(spoken: String, draft: String) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let stable = spoken.isEmpty && draft.isEmpty ? "开口说话…" : spoken
+        if !stable.isEmpty {
+            result.append(NSAttributedString(string: stable, attributes: [
+                .font: NSFont.systemFont(ofSize: 16.5, weight: .medium),
+                .foregroundColor: spoken.isEmpty && draft.isEmpty
+                    ? NSColor(calibratedWhite: 0.52, alpha: 1)
+                    : NSColor.white,
             ]))
         }
         if !draft.isEmpty {
-            let prefix = spoken.isEmpty ? "" : " "
-            body.append(NSAttributedString(string: prefix + draft, attributes: [
-                .font: draftFont,
-                .foregroundColor: NSColor.secondaryLabelColor,
-                .obliqueness: 0.15,
+            result.append(NSAttributedString(string: (spoken.isEmpty ? "" : " ") + draft, attributes: [
+                .font: NSFont.systemFont(ofSize: 16.5, weight: .regular),
+                .foregroundColor: NSColor(calibratedWhite: 0.58, alpha: 1),
+                .obliqueness: 0.12,
             ]))
         }
-        if !translation.isEmpty {
-            body.append(NSAttributedString(string: "\n\n" + translation, attributes: [
-                .font: transFont,
-                .foregroundColor: NSColor.tertiaryLabelColor,
-            ]))
-        }
-        textStorage?.setAttributedString(body)
+        return result
     }
 
-    override func mouseDown(with event: NSEvent) {
-        window?.performDrag(with: event)
+    private func languageTitle(for localeIdentifier: String) -> String {
+        localeIdentifier.lowercased().hasPrefix("en") ? "ENGLISH · FN" : "中文 · 右⌥"
+    }
+
+    private func drawGlow(path: CGPath, in context: CGContext) {
+        let idleBoost: CGFloat = isListening ? 0.22 : 0.08
+        let strength = idleBoost + displayedLevel * 0.78
+        let gradientColors = [
+            NSColor(calibratedRed: 1, green: 0.19, blue: 0.49, alpha: strength).cgColor,
+            NSColor(calibratedRed: 0.68, green: 0.32, blue: 1, alpha: strength).cgColor,
+            NSColor(calibratedRed: 0.16, green: 0.84, blue: 1, alpha: strength).cgColor,
+        ] as CFArray
+        guard let gradient = CGGradient(
+            colorsSpace: CGColorSpaceCreateDeviceRGB(),
+            colors: gradientColors,
+            locations: [0, 0.53, 1]
+        ) else { return }
+
+        context.saveGState()
+        context.addPath(path)
+        context.setLineWidth(7 + displayedLevel * 5)
+        context.replacePathWithStrokedPath()
+        context.clip()
+        context.drawLinearGradient(
+            gradient,
+            start: CGPoint(x: bounds.minX, y: bounds.midY),
+            end: CGPoint(x: bounds.maxX, y: bounds.midY),
+            options: []
+        )
+        context.restoreGState()
+
+        context.saveGState()
+        context.addPath(path)
+        context.setLineWidth(1.2 + displayedLevel * 1.8)
+        context.replacePathWithStrokedPath()
+        context.clip()
+        context.drawLinearGradient(
+            gradient,
+            start: CGPoint(x: bounds.minX, y: bounds.midY),
+            end: CGPoint(x: bounds.maxX, y: bounds.midY),
+            options: []
+        )
+        context.restoreGState()
+    }
+
+    private func drawParticles(in rect: CGRect, context: CGContext) {
+        guard isListening, !reduceMotion, displayedLevel > 0.025 else { return }
+        let colors = [
+            NSColor(calibratedRed: 1, green: 0.32, blue: 0.58, alpha: 1),
+            NSColor(calibratedRed: 0.61, green: 0.42, blue: 1, alpha: 1),
+            NSColor(calibratedRed: 0.25, green: 0.85, blue: 1, alpha: 1),
+        ]
+        for index in 0..<18 {
+            let seed = CGFloat(index) * 1.731
+            let progress = (CGFloat(index) + 0.5) / 18
+            let drift = sin(animationPhase * (0.7 + progress) + seed)
+            let lift = abs(cos(animationPhase * 1.25 + seed))
+            let x = rect.minX + 20 + progress * (rect.width - 40) + drift * 7
+            let y = rect.maxY - 12 - lift * (5 + displayedLevel * 19)
+            let radius = 1.1 + displayedLevel * (1.2 + CGFloat(index % 3) * 0.55)
+            context.setFillColor(colors[index % colors.count].withAlphaComponent(0.16 + displayedLevel * 0.62).cgColor)
+            context.fillEllipse(in: CGRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2))
+        }
     }
 }

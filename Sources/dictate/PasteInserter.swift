@@ -3,6 +3,7 @@ import ApplicationServices
 import CoreGraphics
 
 enum InsertResult: Equatable {
+    case directInserted
     case pasteAttempted
     case copied
     case copiedTargetChanged
@@ -76,6 +77,25 @@ final class TargetSnapshot {
         return CFEqual(focusedElement, current) ? .valid : .changed
     }
 
+    func insertDirectly(_ text: String) -> Bool {
+        guard validate() == .valid else { return false }
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(
+            focusedElement,
+            kAXSelectedTextAttribute as CFString,
+            &settable
+        ) == .success,
+            settable.boolValue
+        else {
+            return false
+        }
+        return AXUIElementSetAttributeValue(
+            focusedElement,
+            kAXSelectedTextAttribute as CFString,
+            text as CFString
+        ) == .success
+    }
+
     private static func focusedElement() -> AXUIElement? {
         let systemWide = AXUIElementCreateSystemWide()
         var value: CFTypeRef?
@@ -117,35 +137,21 @@ enum PasteInserter {
             return .blockedSecureField
         }
 
-        let pasteboard = NSPasteboard.general
-        let previous = PasteboardSnapshot.capture(from: pasteboard)
-        pasteboard.clearContents()
-        pasteboard.setString(trimmed, forType: .string)
-
         guard AXIsProcessTrusted(), let target else {
-            return .copiedOnly
+            return copyForFallback(trimmed, success: .copiedOnly)
         }
 
         switch target.validate() {
         case .valid:
-            let ownedChangeCount = pasteboard.changeCount
-            guard postCommandV() else { return .copiedOnly }
-            restore(
-                previous,
-                to: pasteboard,
-                ifChangeCountIs: ownedChangeCount,
-                after: 0.25
-            )
-            return .pasteAttempted
+            if target.insertDirectly(trimmed) {
+                return .directInserted
+            }
+            return pasteWithClipboard(trimmed)
         case .changed:
-            return .copiedTargetChanged
+            return copyForFallback(trimmed, success: .copiedTargetChanged)
         case .unavailable:
-            return .copiedOnly
+            return copyForFallback(trimmed, success: .copiedOnly)
         case .secure:
-            // The secure check above happens before the clipboard write. This
-            // branch only covers a target that became secure during commit.
-            pasteboard.clearContents()
-            previous.restore(to: pasteboard)
             return .blockedSecureField
         }
     }
@@ -178,6 +184,38 @@ enum PasteInserter {
             guard pasteboard.changeCount == ownedChangeCount else { return }
             snapshot.restore(to: pasteboard)
         }
+    }
+
+    private static func pasteWithClipboard(_ text: String) -> InsertResult {
+        let pasteboard = NSPasteboard.general
+        let previous = PasteboardSnapshot.capture(from: pasteboard)
+        pasteboard.clearContents()
+        guard pasteboard.setString(text, forType: .string) else {
+            previous.restore(to: pasteboard)
+            return .copyFailed
+        }
+
+        let ownedChangeCount = pasteboard.changeCount
+        guard postCommandV() else { return .copiedOnly }
+        restore(
+            previous,
+            to: pasteboard,
+            ifChangeCountIs: ownedChangeCount,
+            after: 0.25
+        )
+        return .pasteAttempted
+    }
+
+    private static func copyForFallback(
+        _ text: String,
+        success: InsertResult
+    ) -> InsertResult {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.setString(text, forType: .string) else {
+            return .copyFailed
+        }
+        return success
     }
 
     private static func postCommandV() -> Bool {

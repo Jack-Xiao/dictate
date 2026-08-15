@@ -3,17 +3,18 @@ import ApplicationServices
 import DictateCore
 import Foundation
 
-/// Right Option hold-to-talk. A short tap or an Option shortcut does not start
-/// dictation. Escape cancels keyboard- or menu-started utterances.
+/// Right Option starts Chinese dictation and Fn starts English dictation. A
+/// short tap or a modifier shortcut does not start dictation. Escape cancels
+/// keyboard- or menu-started utterances.
 @MainActor
 final class HotkeyMonitor {
     private enum Callback: Sendable {
-        case talkDown
+        case talkDown(TalkKey.Route)
         case talkUp
         case cancel
     }
 
-    var onTalkDown: (() -> Void)?
+    var onTalkDown: ((TalkKey.Route) -> Void)?
     var onTalkUp: (() -> Void)?
     var onCancel: (() -> Void)?
     var isTalkActive: (() -> Bool)?
@@ -23,6 +24,8 @@ final class HotkeyMonitor {
     private var source: CFRunLoopSource?
     private var activationWorkItem: DispatchWorkItem?
     private var gesture = TalkGesture()
+    private var activeKeycode: Int64?
+    private var activeRoute: TalkKey.Route?
 
     func start() -> Bool {
         stop()
@@ -67,6 +70,7 @@ final class HotkeyMonitor {
         tap = nil
         source = nil
         apply(gesture.reset(cancelActive: false))
+        clearTrigger()
     }
 
     func requestAccessibilityPrompt() {
@@ -83,6 +87,7 @@ final class HotkeyMonitor {
             let actions = gesture.reset(cancelActive: true)
             let gestureAlreadyCancels = actions.contains(.cancelTalk)
             apply(actions)
+            clearTrigger()
             if !gestureAlreadyCancels, isTalkActive?() ?? false {
                 dispatchCallback(.cancel)
             }
@@ -98,6 +103,7 @@ final class HotkeyMonitor {
            gesture.phase == .talking || (isTalkActive?() ?? false)
         {
             apply(gesture.reset(cancelActive: false))
+            clearTrigger()
             dispatchCallback(.cancel)
             return nil
         }
@@ -107,15 +113,37 @@ final class HotkeyMonitor {
             return Unmanaged.passUnretained(event)
         }
 
-        guard type == .flagsChanged, TalkKey.isPushToTalk(keycode) else {
+        guard type == .flagsChanged, let route = TalkKey.route(for: keycode) else {
             return Unmanaged.passUnretained(event)
         }
 
-        let isDown = CGEventSource.keyState(
-            .combinedSessionState,
-            key: CGKeyCode(TalkKey.rightOption)
-        )
+        let isDown: Bool
+        switch route {
+        case .chinese:
+            isDown = CGEventSource.keyState(
+                .combinedSessionState,
+                key: CGKeyCode(TalkKey.rightOption)
+            )
+        case .english:
+            isDown = event.flags.contains(.maskSecondaryFn)
+        }
+
+        if isDown {
+            guard activeKeycode == nil else {
+                return Unmanaged.passUnretained(event)
+            }
+            activeKeycode = keycode
+            activeRoute = route
+        } else {
+            guard activeKeycode == keycode else {
+                return Unmanaged.passUnretained(event)
+            }
+        }
+
         apply(gesture.optionChanged(isDown: isDown))
+        if !isDown {
+            clearTrigger()
+        }
         return Unmanaged.passUnretained(event)
     }
 
@@ -128,7 +156,9 @@ final class HotkeyMonitor {
                 activationWorkItem?.cancel()
                 activationWorkItem = nil
             case .startTalk:
-                dispatchCallback(.talkDown)
+                if let activeRoute {
+                    dispatchCallback(.talkDown(activeRoute))
+                }
             case .stopTalk:
                 dispatchCallback(.talkUp)
             case .cancelTalk:
@@ -151,13 +181,18 @@ final class HotkeyMonitor {
     private func dispatchCallback(_ callback: Callback) {
         DispatchQueue.main.async { [weak self] in
             switch callback {
-            case .talkDown:
-                self?.onTalkDown?()
+            case .talkDown(let route):
+                self?.onTalkDown?(route)
             case .talkUp:
                 self?.onTalkUp?()
             case .cancel:
                 self?.onCancel?()
             }
         }
+    }
+
+    private func clearTrigger() {
+        activeKeycode = nil
+        activeRoute = nil
     }
 }

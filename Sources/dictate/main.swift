@@ -27,7 +27,8 @@ if #available(macOS 26.0, *) {
     let delegate = AppDelegate(
         localeIdentifier: options.locale,
         translationEnabled: options.translationEnabled,
-        commitMode: options.commitMode
+        commitMode: options.commitMode,
+        previewHUD: options.previewHUD
     )
     Retain.box = delegate
     app.delegate = delegate
@@ -42,14 +43,15 @@ struct CLIOptions {
     var wavPath: String?
     var translationEnabled: Bool?
     var commitMode: DictateCommitMode?
+    var previewHUD = false
 }
 
 func parseArgs(_ args: [String]) -> CLIOptions {
     if args.contains("-h") || args.contains("--help") {
         print("""
-        dictate — 本机流式听写（浮层 + 松手插入）
+        dictate — 本机流式听写（刘海 HUD + 松手插入）
 
-          dictate [--locale zh-CN|en-US] [--translate|--no-translate] [--insert|--copy]
+          dictate [--locale zh-CN|en-US] [--translate|--no-translate] [--insert|--copy] [--preview-hud]
           dictate --wav file.wav [--locale zh-CN] [--translate]
 
         识别语言、翻译和完成方式可在菜单栏切换；设置会自动保存。
@@ -73,6 +75,9 @@ func parseArgs(_ args: [String]) -> CLIOptions {
             i += 1
         case "--copy":
             options.commitMode = .copy
+            i += 1
+        case "--preview-hud":
+            options.previewHUD = true
             i += 1
         case "--locale":
             let next = i + 1
@@ -140,15 +145,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let localeIdentifier: String?
     private let translationEnabled: Bool?
     private let commitMode: DictateCommitMode?
+    private let previewHUD: Bool
 
     init(
         localeIdentifier: String?,
         translationEnabled: Bool?,
-        commitMode: DictateCommitMode?
+        commitMode: DictateCommitMode?,
+        previewHUD: Bool
     ) {
         self.localeIdentifier = localeIdentifier
         self.translationEnabled = translationEnabled
         self.commitMode = commitMode
+        self.previewHUD = previewHUD
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -156,7 +164,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.start(
             localeIdentifier: localeIdentifier,
             translationEnabled: translationEnabled,
-            commitMode: commitMode
+            commitMode: commitMode,
+            previewHUD: previewHUD
         )
         self.controller = controller
     }

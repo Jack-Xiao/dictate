@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Testing
 @testable import dictate
 
@@ -77,4 +78,22 @@ import Testing
     let runner = SpeechRunner()
     await runner.cancel()
     await runner.cancel()
+}
+
+@Test func microphoneLevelMeterMapsSilenceAndSpeechIntoHUDRange() {
+    let format = AVAudioFormat(
+        standardFormatWithSampleRate: 48_000,
+        channels: 1
+    )!
+    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1_024)!
+    buffer.frameLength = 1_024
+    let samples = buffer.floatChannelData![0]
+
+    samples.update(repeating: 0, count: 1_024)
+    #expect(MicLevelMeter.normalizedLevel(for: buffer) == 0)
+
+    samples.update(repeating: 0.1, count: 1_024)
+    let voiceLevel = MicLevelMeter.normalizedLevel(for: buffer)
+    #expect(voiceLevel > 0.6)
+    #expect(voiceLevel <= 1)
 }

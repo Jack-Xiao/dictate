@@ -96,7 +96,8 @@ final class AppController: NSObject, NSMenuItemValidation {
     func start(
         localeIdentifier: String?,
         translationEnabled: Bool?,
-        commitMode: DictateCommitMode?
+        commitMode: DictateCommitMode?,
+        previewHUD: Bool = false
     ) {
         settings = DictateSettings.load(
             localeOverride: localeIdentifier,
@@ -106,7 +107,9 @@ final class AppController: NSObject, NSMenuItemValidation {
         translator = settings.translationEnabled ? AppleTranslator() : nil
 
         installStatusItem()
-        hotkey.onTalkDown = { [weak self] in self?.beginTalk() }
+        hotkey.onTalkDown = { [weak self] route in
+            self?.beginTalk(localeIdentifier: route.localeIdentifier)
+        }
         hotkey.onTalkUp = { [weak self] in self?.endTalk() }
         hotkey.onCancel = { [weak self] in self?.cancelTalk() }
         hotkey.isTalkActive = { [weak self] in self?.active != nil }
@@ -120,33 +123,39 @@ final class AppController: NSObject, NSMenuItemValidation {
             overlay.hide(after: 10)
         }
 
-        preheatRecognitionModel()
-    }
-
-    private func preheatRecognitionModel() {
-        preheatTask?.cancel()
-        let localeIdentifier = settings.localeIdentifier
-        preheatTask = Task {
-            let granted = await AVAudioApplication.requestRecordPermission()
-            guard granted, !Task.isCancelled else { return }
-            try? await SpeechRunner.preheatModel(localeIdentifier: localeIdentifier)
+        preheatRecognitionModels()
+        if previewHUD {
+            overlay.showPreview()
         }
     }
 
-    private func beginTalk() {
+    private func preheatRecognitionModels() {
+        preheatTask?.cancel()
+        preheatTask = Task {
+            let granted = await AVAudioApplication.requestRecordPermission()
+            guard granted, !Task.isCancelled else { return }
+            await SpeechRunner.preheatModels(localeIdentifiers: ["zh-CN", "en-US"])
+        }
+    }
+
+    private func beginTalk(localeIdentifier override: String? = nil) {
         if let previous = active {
             abandon(previous)
         }
 
         let transaction = UtteranceTransaction(
             target: TargetSnapshot.capture(),
-            localeIdentifier: localeIdentifier,
+            localeIdentifier: override ?? localeIdentifier,
             translationEnabled: translationEnabled,
             commitMode: commitMode,
             translator: translator
         )
         active = transaction
-        overlay.show(session: transaction.session, status: listeningStatus(for: transaction))
+        overlay.show(
+            session: transaction.session,
+            status: listeningStatus(for: transaction),
+            localeIdentifier: transaction.localeIdentifier
+        )
 
         let task = Task { [weak self, weak transaction] in
             guard let self, let transaction else { return }
@@ -158,13 +167,23 @@ final class AppController: NSObject, NSMenuItemValidation {
             }
 
             do {
-                try await transaction.runner.start(localeIdentifier: transaction.localeIdentifier) {
-                    [weak self, weak transaction] hypothesis in
-                    MainActor.assumeIsolated {
-                        guard let self, let transaction else { return }
-                        self.ingest(hypothesis, into: transaction)
+                try await transaction.runner.start(
+                    localeIdentifier: transaction.localeIdentifier,
+                    onAudioLevel: { [weak self, weak transaction] level in
+                        MainActor.assumeIsolated {
+                            guard let self, let transaction, self.isCurrent(transaction) else {
+                                return
+                            }
+                            self.overlay.updateAudioLevel(level)
+                        }
+                    },
+                    onHypothesis: { [weak self, weak transaction] hypothesis in
+                        MainActor.assumeIsolated {
+                            guard let self, let transaction else { return }
+                            self.ingest(hypothesis, into: transaction)
+                        }
                     }
-                }
+                )
             } catch is CancellationError {
                 return
             } catch {
@@ -190,13 +209,22 @@ final class AppController: NSObject, NSMenuItemValidation {
                 transaction: transaction
             )
         }
-        overlay.show(session: transaction.session, status: listeningStatus(for: transaction))
+        overlay.show(
+            session: transaction.session,
+            status: listeningStatus(for: transaction),
+            localeIdentifier: transaction.localeIdentifier
+        )
     }
 
     private func endTalk() {
         guard let transaction = active, transaction.session.phase == .listening else { return }
         transaction.session.markStopping()
-        overlay.show(session: transaction.session, status: "正在收尾…")
+        overlay.updateAudioLevel(0)
+        overlay.show(
+            session: transaction.session,
+            status: "正在收尾…",
+            localeIdentifier: transaction.localeIdentifier
+        )
 
         Task { [weak self, weak transaction] in
             guard let self, let transaction else { return }
@@ -215,7 +243,11 @@ final class AppController: NSObject, NSMenuItemValidation {
             guard self.isCurrent(transaction, phase: .stopping) else { return }
             var translationOutcome: TranslationBatch.Outcome = .completed
             if transaction.translationEnabled {
-                self.overlay.show(session: transaction.session, status: "正在翻译…")
+                self.overlay.show(
+                    session: transaction.session,
+                    status: "正在翻译…",
+                    localeIdentifier: transaction.localeIdentifier
+                )
                 translationOutcome = await transaction.waitForTranslations(
                     timeoutNanoseconds: 2_000_000_000
                 )
@@ -248,7 +280,7 @@ final class AppController: NSObject, NSMenuItemValidation {
             switch result {
             case .empty, .blockedSecureField, .copyFailed:
                 break
-            case .pasteAttempted, .copied, .copiedTargetChanged, .copiedOnly:
+            case .directInserted, .pasteAttempted, .copied, .copiedTargetChanged, .copiedOnly:
                 self.lastPayload = payload
                 self.refreshSettingsMenu()
             }
@@ -304,7 +336,8 @@ final class AppController: NSObject, NSMenuItemValidation {
                 transaction.session.setTranslation(translated, for: segmentID)
                 self.overlay.show(
                     session: transaction.session,
-                    status: self.listeningStatus(for: transaction)
+                    status: self.listeningStatus(for: transaction),
+                    localeIdentifier: transaction.localeIdentifier
                 )
             } catch {
                 guard !Task.isCancelled,
@@ -377,6 +410,9 @@ final class AppController: NSObject, NSMenuItemValidation {
         case .empty:
             overlay.showMessage("没有识别到定稿文字")
             overlay.hide(after: 0.9)
+        case .directInserted:
+            overlay.showMessage("已写入原输入框\(note)")
+            overlay.hide(after: translationNote == nil ? 0.45 : 1.5)
         case .pasteAttempted:
             overlay.showMessage("已发送到原输入框\(note)")
             overlay.hide(after: translationNote == nil ? 0.5 : 1.5)
@@ -402,7 +438,7 @@ final class AppController: NSObject, NSMenuItemValidation {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
             button.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Dictate")
-            button.toolTip = "Dictate：按住右 Option 说话"
+            button.toolTip = "Dictate：右 Option 中文，Fn English"
         }
         let menu = NSMenu()
         let toggle = NSMenuItem(
@@ -412,8 +448,10 @@ final class AppController: NSObject, NSMenuItemValidation {
         )
         toggle.target = self
         menu.addItem(toggle)
-        menu.addItem(withTitle: "按住右 Option 说话（快捷键组合不会触发）", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "按住右 Option：中文（可夹英文）", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "按住 Fn：English", action: nil, keyEquivalent: "")
         menu.addItem(withTitle: "Esc 取消当前识别", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "预览刘海 HUD", action: #selector(previewHUD), keyEquivalent: "")
         menu.addItem(.separator())
 
         let languageItem = NSMenuItem(title: "识别语言", action: nil, keyEquivalent: "")
@@ -502,7 +540,7 @@ final class AppController: NSObject, NSMenuItemValidation {
         copyLastMenuItem?.isEnabled = lastPayload != nil
         let destination = commitMode == .insert ? "插入" : "复制"
         let translation = translationEnabled ? "，含翻译" : ""
-        statusItem?.button?.toolTip = "Dictate：按住右 Option 说话（\(localeIdentifier)，\(destination)\(translation)）"
+        statusItem?.button?.toolTip = "Dictate：右 Option 中文 / Fn English（菜单启动：\(localeIdentifier)，\(destination)\(translation)）"
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
@@ -517,7 +555,7 @@ final class AppController: NSObject, NSMenuItemValidation {
         settings.localeIdentifier = localeIdentifier
         settings.save()
         refreshSettingsMenu()
-        preheatRecognitionModel()
+        preheatRecognitionModels()
         overlay.showMessage("识别语言已切换为 \(title)")
         overlay.hide(after: 1.2)
     }
@@ -567,6 +605,12 @@ final class AppController: NSObject, NSMenuItemValidation {
         if let url = URL(string: "x-apple.systempreferences:com.apple.Localization-Settings.extension") {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    @objc private func previewHUD() {
+        if active != nil { cancelTalk() }
+        overlay.showPreview()
+        overlay.hide(after: 6)
     }
 
     @objc private func openAccessibility() {
